@@ -4,6 +4,7 @@
 package failoverconnector // import "github.com/open-telemetry/opentelemetry-collector-contrib/connector/failoverconnector"
 
 import (
+	"context"
 	"errors"
 
 	"go.opentelemetry.io/collector/pipeline"
@@ -12,10 +13,7 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/connector/failoverconnector/internal/state"
 )
 
-var (
-	errNoValidPipeline = errors.New("All provided pipelines return errors")
-	errConsumer        = errors.New("Error registering consumer")
-)
+var errConsumer = errors.New("Error registering consumer")
 
 type consumerProvider[C any] func(...pipeline.ID) (C, error)
 
@@ -25,7 +23,6 @@ type baseFailoverRouter[C any] struct {
 	pS        *state.PipelineSelector
 	consumers []C
 
-	errTryLock  *state.TryLock
 	notifyRetry chan struct{}
 	done        chan struct{}
 	conditions  Condition
@@ -34,11 +31,7 @@ type baseFailoverRouter[C any] struct {
 
 // getCurrentConsumer returns the consumer for the current healthy level
 func (f *baseFailoverRouter[C]) getCurrentConsumer() (C, int) {
-	var nilConsumer C
 	pl := f.pS.CurrentPipeline()
-	if pl >= len(f.cfg.PipelinePriority) {
-		return nilConsumer, pl
-	}
 	return f.consumers[pl], pl
 }
 
@@ -47,12 +40,25 @@ func (f *baseFailoverRouter[C]) getConsumerAtIndex(idx int) C {
 	return f.consumers[idx]
 }
 
-// reportConsumerError ensures only one consumer is reporting an error at a time to avoid multiple failovers
-func (f *baseFailoverRouter[C]) reportConsumerError(idx int, err error) {
-	if f.conditions != nil {
-		f.logger.Debug("Downstream error matched failover condition; moving to the next pipeline level", zap.Error(err), zap.Int("pipeline_level", idx))
+// reportConsumerError records a failure on level idx and reports whether the data should be
+// retried on the current level. The last level never fails over, there is nothing to fail over to,
+// so its error goes back to the caller and the next call tries the same level again.
+func (f *baseFailoverRouter[C]) reportConsumerError(idx int, err error) bool {
+	if idx == len(f.cfg.PipelinePriority)-1 {
+		return false
 	}
-	f.errTryLock.TryExecute(f.pS.HandleError, idx)
+	if f.conditions != nil {
+		f.logger.Debug("Downstream error matched failover condition", zap.Error(err), zap.Int("pipeline_level", idx))
+	}
+	return f.pS.HandleError(idx)
+}
+
+// retryContext bounds a recovery attempt by RetryTimeout.
+func (f *baseFailoverRouter[C]) retryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if f.cfg.RetryTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, f.cfg.RetryTimeout)
 }
 
 // shouldFailoverOnError goes through the user defined condition
@@ -77,6 +83,7 @@ func newBaseFailoverRouter[C any](provider consumerProvider[C], cfg *Config, log
 	notifyRetry := make(chan struct{}, 1)
 	pSConstants := state.PSConstants{
 		RetryInterval: cfg.RetryInterval,
+		FailoverAfter: cfg.FailoverAfter,
 	}
 
 	consumers := make([]C, 0)
@@ -93,7 +100,6 @@ func newBaseFailoverRouter[C any](provider consumerProvider[C], cfg *Config, log
 		consumers:   consumers,
 		cfg:         cfg,
 		pS:          selector,
-		errTryLock:  state.NewTryLock(),
 		done:        done,
 		notifyRetry: notifyRetry,
 		conditions:  buildCondition(cfg.Condition.Get()),

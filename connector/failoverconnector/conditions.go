@@ -7,12 +7,14 @@ import (
 	"errors"
 	"slices"
 	"strings"
+
+	"go.opentelemetry.io/collector/consumer/consumererror"
 )
 
 var (
 	errNoConditionDefined           = errors.New("no condition is defined")
 	errTooManyConditions            = errors.New("only one failover condition can be applied")
-	errEmptyErrorContains           = errors.New("error condition must define non-empty 'contains' strings")
+	errEmptyErrorContains           = errors.New("error condition must define non-empty 'contains' strings or 'permanent'")
 	_                     Condition = (*ErrorCondition)(nil)
 )
 
@@ -55,24 +57,34 @@ type ErrorCondition struct {
 	// An error matching any substring triggers failover.
 	Contains []string `mapstructure:"contains"`
 
+	// Permanent controls whether permanent errors (consumererror.IsPermanent) trigger failover.
+	// When unset they are treated like any other error. When false they are returned to the caller as is.
+	Permanent *bool `mapstructure:"permanent"`
+
 	// prevent unkeyed literal initialization
 	_ struct{}
 }
 
 // Validate ensures the error condition has a usable match string.
 func (c *ErrorCondition) Validate() error {
-	if len(c.Contains) == 0 || slices.Contains(c.Contains, "") {
+	if (len(c.Contains) == 0 && c.Permanent == nil) || slices.Contains(c.Contains, "") {
 		return errEmptyErrorContains
 	}
 	return nil
 }
 
 // ShouldFailover reports whether err should trigger failover.
-// A nil error never triggers failover, otherwise failover happens only
-// when the error message contains the configured substring.
+// A nil error never triggers failover. A permanent error follows Permanent when it is set. Otherwise
+// failover happens when no substring is configured or the error message contains one.
 func (c *ErrorCondition) ShouldFailover(err error) bool {
 	if err == nil {
 		return false
+	}
+	if c.Permanent != nil && consumererror.IsPermanent(err) {
+		return *c.Permanent
+	}
+	if len(c.Contains) == 0 {
+		return true
 	}
 	message := strings.ToLower(err.Error())
 	for _, value := range c.Contains {

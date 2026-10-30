@@ -79,6 +79,21 @@ func TestLoadConfig(t *testing.T) {
 				}),
 			},
 		},
+		{
+			id: component.NewIDWithName(metadata.Type, "spill"),
+			expected: &Config{
+				PipelinePriority: [][]pipeline.ID{
+					{pipeline.NewIDWithName(pipeline.SignalLogs, "primary")},
+					{pipeline.NewIDWithName(pipeline.SignalLogs, "spill")},
+				},
+				RetryInterval: 30 * time.Second,
+				FailoverAfter: 2 * time.Minute,
+				RetryTimeout:  5 * time.Second,
+				Condition: configoptional.Some(ConditionsConfig{
+					ErrorCond: &ErrorCondition{Permanent: new(false)},
+				}),
+			},
+		},
 	}
 
 	for _, tc := range testcases {
@@ -114,6 +129,11 @@ func TestValidateConfig(t *testing.T) {
 			name: "invalid retry_interval",
 			id:   component.NewIDWithName(metadata.Type, "invalid"),
 			err:  errInvalidRetryIntervals,
+		},
+		{
+			name: "negative failover_after",
+			id:   component.NewIDWithName(metadata.Type, "negativeduration"),
+			err:  errNegativeDuration,
 		},
 		{
 			name: "empty condition block",

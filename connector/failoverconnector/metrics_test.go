@@ -157,7 +157,9 @@ func TestMetricsWithFailoverError(t *testing.T) {
 
 	md := sampleMetric()
 
-	assert.EqualError(t, conn.ConsumeMetrics(t.Context(), md), "All provided pipelines return errors")
+	// The last level never fails over, so its own error goes back to the caller.
+	assert.ErrorIs(t, conn.ConsumeMetrics(t.Context(), md), errMetricsConsumer)
+	assert.Equal(t, 2, failoverConnector.failover.TestGetCurrentConsumerIndex())
 }
 
 func TestMetricsWithQueue(t *testing.T) {

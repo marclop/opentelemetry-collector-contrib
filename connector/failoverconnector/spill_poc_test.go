@@ -7,7 +7,8 @@ package failoverconnector
 // "spill" switch: level 0 is the real destination X (an exporter), level 1 is
 // a spill exporter that must never lose data. Tests named TestGap_* document
 // behavior that does not fit the spill design. The others show behavior that
-// does fit.
+// does fit. With failover_after, retry_timeout and condition.error.permanent
+// set, the connector closes most of those gaps.
 
 import (
 	"context"
@@ -145,8 +146,8 @@ func timed(fn func() error) (time.Duration, error) {
 	return time.Since(start), err
 }
 
-// Scenario 1.
-func TestGap_SingleTransientErrorSpillsEverything(t *testing.T) {
+// Scenario 1. The default, failover_after unset, keeps failing over on the first error.
+func TestSingleTransientErrorSpillsEverythingByDefault(t *testing.T) {
 	var failNext atomic.Bool
 	failNext.Store(true)
 	x := newFakeLogs(func(context.Context, plog.Logs) error {
@@ -167,6 +168,65 @@ func TestGap_SingleTransientErrorSpillsEverything(t *testing.T) {
 	assert.Equal(t, 6, spill.acceptedRecords(), "the failed call and the 5 after it all went to the spill")
 	assert.Equal(t, 0, x.acceptedRecords())
 	assert.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex())
+}
+
+func TestFailoverAfterRidesOutTransientErrors(t *testing.T) {
+	const failoverAfter = 300 * time.Millisecond
+
+	t.Run("a success between failures restarts the clock", func(t *testing.T) {
+		var down atomic.Bool
+		down.Store(true)
+		x := newFakeLogs(func(context.Context, plog.Logs) error {
+			if down.Load() {
+				return errXDown
+			}
+			return nil
+		})
+		spill := newFakeLogs(alwaysSucceed())
+		cfg := spillConfig(time.Hour)
+		cfg.FailoverAfter = failoverAfter
+		f := newSpillConnector(t, cfg, x, spill)
+
+		require.ErrorIs(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)), errXDown, "error goes back so the receiver retries")
+		time.Sleep(failoverAfter + 50*time.Millisecond)
+		down.Store(false)
+		require.NoError(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)))
+		down.Store(true)
+		require.ErrorIs(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)), errXDown, "the old failure no longer counts")
+
+		assert.Equal(t, 0, f.failover.TestGetCurrentConsumerIndex())
+		assert.Equal(t, 0, spill.acceptedRecords())
+		assert.Equal(t, 1, x.acceptedRecords())
+	})
+
+	t.Run("sustained failure spills once failover_after has elapsed", func(t *testing.T) {
+		const budget = 50 * time.Millisecond
+		x := newFakeLogs(alwaysFail(errXDown))
+		spill := newFakeLogs(alwaysSucceed())
+		cfg := spillConfig(time.Hour)
+		cfg.FailoverAfter = failoverAfter
+		f := newSpillConnector(t, cfg, newExporter(t, x, budget), spill)
+
+		start := time.Now()
+		var blocked, rejected int
+		for {
+			elapsed, err := timed(func() error { return f.ConsumeLogs(t.Context(), logsWithRecords(1)) })
+			if err == nil {
+				break
+			}
+			require.ErrorIs(t, err, errXDown)
+			assert.Less(t, elapsed, budget+200*time.Millisecond, "each call is held for the exporter retry budget only")
+			rejected++
+			blocked += int(elapsed.Milliseconds())
+			require.Less(t, time.Since(start), 5*time.Second)
+		}
+		total := time.Since(start)
+		t.Logf("spilled after %s, %d calls returned an error first, each held about %dms", total, rejected, blocked/rejected)
+		assert.GreaterOrEqual(t, total, failoverAfter)
+		assert.Less(t, total, failoverAfter+budget+300*time.Millisecond)
+		assert.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex())
+		assert.Equal(t, 1, spill.acceptedRecords(), "only the call that crossed the threshold is spilled, earlier ones were retried by the caller")
+	})
 }
 
 // Scenario 2.
@@ -190,14 +250,14 @@ func TestFailoverOnlyAfterExporterRetryBudget(t *testing.T) {
 	assert.Less(t, second, 50*time.Millisecond, "once demoted, X is skipped")
 }
 
-// Scenario 3.
-func TestGap_RecoveryProbeStallsLiveCall(t *testing.T) {
+// Scenario 3. Without retry_timeout the recovery attempt waits out X's retry budget.
+func TestRecoveryProbe(t *testing.T) {
 	const (
 		budget   = 300 * time.Millisecond
 		interval = 150 * time.Millisecond
 	)
 
-	t.Run("every tick stalls one live call for the whole retry budget", func(t *testing.T) {
+	t.Run("retry_timeout unset: every tick stalls one live call for the whole retry budget", func(t *testing.T) {
 		x := newFakeLogs(alwaysFail(errXDown))
 		spill := newFakeLogs(alwaysSucceed())
 		f := newSpillConnector(t, spillConfig(interval), newExporter(t, x, budget), spill)
@@ -219,6 +279,27 @@ func TestGap_RecoveryProbeStallsLiveCall(t *testing.T) {
 		assert.Equal(t, 4, spill.acceptedRecords(), "no data lost, each probed batch still reached the spill")
 	})
 
+	t.Run("retry_timeout bounds the stall and the batch still reaches the spill", func(t *testing.T) {
+		const retryTimeout = 80 * time.Millisecond
+		x := newFakeLogs(alwaysFail(errXDown))
+		spill := newFakeLogs(alwaysSucceed())
+		cfg := spillConfig(interval)
+		cfg.RetryTimeout = retryTimeout
+		f := newSpillConnector(t, cfg, newExporter(t, x, budget), spill)
+		_, err := timed(func() error { return f.ConsumeLogs(t.Context(), logsWithRecords(1)) })
+		require.NoError(t, err)
+
+		for i := range 3 {
+			time.Sleep(interval + 50*time.Millisecond)
+			probe, err := timed(func() error { return f.ConsumeLogs(t.Context(), logsWithRecords(1)) })
+			require.NoError(t, err)
+			t.Logf("tick %d: live call blocked %s (retry_timeout %s)", i, probe, retryTimeout)
+			assert.Less(t, probe, retryTimeout+100*time.Millisecond)
+			assert.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex())
+		}
+		assert.Equal(t, 4, spill.acceptedRecords())
+	})
+
 	t.Run("a ctx deadline shorter than the retry budget makes the probe fail fast", func(t *testing.T) {
 		x := newFakeLogs(alwaysFail(errXDown))
 		spill := newFakeLogs(alwaysSucceed())
@@ -235,32 +316,83 @@ func TestGap_RecoveryProbeStallsLiveCall(t *testing.T) {
 		assert.Less(t, probe, budget, "exporterhelper gives up when the next retry would pass the deadline")
 	})
 
-	t.Run("a hung X spends the whole deadline, the spill sees an expired ctx and is demoted too", func(t *testing.T) {
-		x := newFakeLogs(alwaysFail(errXDown))
-		ctxAwareSpill := newFakeLogs(func(ctx context.Context, _ plog.Logs) error { return ctx.Err() })
-		f := newSpillConnector(t, spillConfig(interval), x, ctxAwareSpill)
-		// Demote X with a live ctx, then let X hang like a request without a timeout.
-		require.NoError(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)))
-		require.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex())
-		x.set(func(ctx context.Context, _ plog.Logs) error {
-			<-ctx.Done()
-			return ctx.Err()
+	for _, tt := range []struct {
+		name         string
+		retryTimeout time.Duration
+		wantErr      bool
+	}{
+		{name: "retry_timeout unset: a hung X spends the caller's deadline and the spill sees an expired ctx", wantErr: true},
+		{name: "retry_timeout set: a hung X is cut off and the spill still has the caller's ctx", retryTimeout: 30 * time.Millisecond},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			testHungProbe(t, interval, tt.retryTimeout, tt.wantErr)
 		})
+	}
+}
 
-		time.Sleep(interval + 50*time.Millisecond)
-		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-		defer cancel()
-		probe, err := timed(func() error { return f.ConsumeLogs(ctx, logsWithRecords(1)) })
-		t.Logf("probe blocked %s, err=%v", probe, err)
-		require.ErrorIs(t, err, errNoValidPipeline, "the probe consumed the caller's budget and the spill call failed with the expired ctx")
-		assert.Equal(t, 1, ctxAwareSpill.acceptedRecords(), "only the batch from before the probe was spilled")
-		assert.Equal(t, 2, f.failover.TestGetCurrentConsumerIndex(), "a caller-side ctx expiry demoted the healthy spill level too")
+func testHungProbe(t *testing.T, interval, retryTimeout time.Duration, wantErr bool) {
+	t.Helper()
+	x := newFakeLogs(alwaysFail(errXDown))
+	ctxAwareSpill := newFakeLogs(func(ctx context.Context, _ plog.Logs) error { return ctx.Err() })
+	cfg := spillConfig(interval)
+	cfg.RetryTimeout = retryTimeout
+	f := newSpillConnector(t, cfg, x, ctxAwareSpill)
+	// Demote X with a live ctx, then let X hang like a request without a timeout.
+	require.NoError(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)))
+	require.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex())
+	x.set(func(ctx context.Context, _ plog.Logs) error {
+		<-ctx.Done()
+		return ctx.Err()
 	})
+
+	time.Sleep(interval + 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	probe, err := timed(func() error { return f.ConsumeLogs(ctx, logsWithRecords(1)) })
+	t.Logf("probe blocked %s, err=%v", probe, err)
+	if wantErr {
+		require.ErrorIs(t, err, context.DeadlineExceeded, "the probe consumed the caller's budget and the spill call failed with the expired ctx")
+		assert.Equal(t, 1, ctxAwareSpill.acceptedRecords(), "only the batch from before the probe was spilled")
+	} else {
+		require.NoError(t, err)
+		assert.Equal(t, 2, ctxAwareSpill.acceptedRecords())
+	}
+	assert.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex(), "the last level is never demoted")
 }
 
 // Scenario 4.
-func TestGap_PermanentErrorSpills(t *testing.T) {
+func TestPermanentErrors(t *testing.T) {
 	permanentErr := consumererror.NewPermanent(errors.New("elasticsearch: 400 mapper_parsing_exception"))
+
+	t.Run("condition.error.permanent false returns permanent errors as is and keeps X active", func(t *testing.T) {
+		cfg := spillConfig(time.Hour)
+		cfg.Condition = configoptional.Some(ConditionsConfig{ErrorCond: &ErrorCondition{Permanent: new(false)}})
+		x := newFakeLogs(alwaysFail(permanentErr))
+		spill := newFakeLogs(alwaysSucceed())
+		f := newSpillConnector(t, cfg, x, spill)
+
+		require.ErrorIs(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)), permanentErr)
+		assert.True(t, consumererror.IsPermanent(f.ConsumeLogs(t.Context(), logsWithRecords(1))))
+		assert.Equal(t, 0, f.failover.TestGetCurrentConsumerIndex())
+		assert.Equal(t, 0, spill.acceptedRecords())
+
+		x.set(alwaysFail(errXDown))
+		require.NoError(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)), "any other error still spills, whatever its message")
+		assert.Equal(t, 1, spill.acceptedRecords())
+		assert.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex())
+	})
+
+	t.Run("a permanent error whose message matches contains is still returned as is when permanent is false", func(t *testing.T) {
+		matching := consumererror.NewPermanent(errors.New("mapping failed: connection refused"))
+		cfg := spillConfig(time.Hour)
+		cfg.Condition = configoptional.Some(ConditionsConfig{ErrorCond: &ErrorCondition{Contains: []string{"connection refused"}, Permanent: new(false)}})
+		x := newFakeLogs(alwaysFail(matching))
+		spill := newFakeLogs(alwaysSucceed())
+		f := newSpillConnector(t, cfg, x, spill)
+
+		require.ErrorIs(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)), matching)
+		assert.Equal(t, 0, spill.acceptedRecords())
+	})
 
 	t.Run("without a condition a permanent error spills and demotes X", func(t *testing.T) {
 		x := newFakeLogs(alwaysFail(permanentErr))
@@ -272,7 +404,7 @@ func TestGap_PermanentErrorSpills(t *testing.T) {
 		assert.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex(), "one poison record demotes X for everyone")
 	})
 
-	t.Run("contains is an allow list of retryable strings and cannot express not permanent", func(t *testing.T) {
+	t.Run("contains alone is an allow list of retryable strings and cannot express not permanent", func(t *testing.T) {
 		tests := []struct {
 			name        string
 			xErr        error
@@ -312,45 +444,25 @@ func TestBothLevelsFailReturnsErrorToCaller(t *testing.T) {
 	f := newSpillConnector(t, spillConfig(time.Hour), x, spill)
 
 	err := f.ConsumeLogs(t.Context(), logsWithRecords(1))
-	require.ErrorIs(t, err, errNoValidPipeline, "error reaches the receiver, nothing is dropped")
-	assert.NotErrorIs(t, err, errSpillDown, "the original errors are replaced by a generic one")
+	require.ErrorIs(t, err, errSpillDown, "the spill's own error reaches the receiver, nothing is dropped")
 	assert.Equal(t, int64(1), x.attempts.Load())
 	assert.Equal(t, int64(1), spill.attempts.Load())
 }
 
-func TestGap_StuckPastLastLevelUntilNextTick(t *testing.T) {
-	const interval = 400 * time.Millisecond
+func TestSpillRecoveryDoesNotWaitForRetryTick(t *testing.T) {
 	x := newFakeLogs(alwaysFail(errXDown))
 	spill := newFakeLogs(alwaysFail(errSpillDown))
-	f := newSpillConnector(t, spillConfig(interval), x, spill)
+	f := newSpillConnector(t, spillConfig(time.Hour), x, spill)
 
-	start := time.Now()
-	require.ErrorIs(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)), errNoValidPipeline)
-	require.Equal(t, 2, f.failover.TestGetCurrentConsumerIndex(), "past the last level")
+	for range 3 {
+		require.ErrorIs(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)), errSpillDown)
+	}
+	require.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex(), "the last level stays active, nothing sits past it")
+	assert.Equal(t, int64(1), x.attempts.Load(), "X is skipped while the spill is the active level")
+	assert.Equal(t, int64(3), spill.attempts.Load(), "every call retries the spill")
 
-	// The spill recovers right away. X stays down.
 	spill.set(alwaysSucceed())
-	recoveredAt := time.Now()
-	xBefore, spillBefore := x.attempts.Load(), spill.attempts.Load()
-
-	var stuckCalls int
-	require.Eventually(t, func() bool {
-		if err := f.ConsumeLogs(t.Context(), logsWithRecords(1)); err != nil {
-			require.ErrorIs(t, err, errNoValidPipeline)
-			stuckCalls++
-			return false
-		}
-		return true
-	}, 5*time.Second, 5*time.Millisecond)
-
-	stuck := time.Since(recoveredAt)
-	t.Logf("spill healthy for %s before the connector tried it again (retry_interval %s, %d calls failed without any attempt, since first failure %s)",
-		stuck, interval, stuckCalls, time.Since(start))
-	assert.Greater(t, stuckCalls, 10, "calls were rejected without trying either level")
-	assert.Greater(t, stuck, interval/4, "recovery waits for the next retry tick")
-	assert.Equal(t, int64(1), spill.attempts.Load()-spillBefore, "the spill was not tried during the stuck window, only by the probe")
-	assert.Equal(t, int64(1), x.attempts.Load()-xBefore, "the probe also retried X first")
-	assert.Equal(t, 1, f.failover.TestGetCurrentConsumerIndex())
+	require.NoError(t, f.ConsumeLogs(t.Context(), logsWithRecords(1)), "first call after the spill recovered, with retry_interval at 1h")
 	assert.Equal(t, 1, spill.acceptedRecords())
 }
 
@@ -435,7 +547,7 @@ func TestSendingQueueConfigForSynchronousErrors(t *testing.T) {
 			err = conn.ConsumeLogs(t.Context(), logsWithRecords(1))
 			if tt.wantErrOnFail {
 				require.Error(t, err, "both levels fail, the caller must see it")
-				assert.ErrorContains(t, err, errNoValidPipeline.Error())
+				assert.ErrorContains(t, err, errSpillDown.Error())
 			} else {
 				require.NoError(t, err, "queue acked data that nobody delivered")
 			}

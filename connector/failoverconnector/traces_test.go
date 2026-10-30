@@ -133,7 +133,9 @@ func TestTracesWithFailoverError(t *testing.T) {
 
 	tr := sampleTrace()
 
-	assert.EqualError(t, failoverConnector.ConsumeTraces(t.Context(), tr), "All provided pipelines return errors")
+	// The last level never fails over, so its own error goes back to the caller.
+	assert.ErrorIs(t, failoverConnector.ConsumeTraces(t.Context(), tr), errTracesConsumer)
+	assert.Equal(t, 2, failoverConnector.failover.TestGetCurrentConsumerIndex())
 }
 
 func TestTracesWithQueue(t *testing.T) {

@@ -49,3 +49,22 @@ failover/emptyerrorcontains:
   retry_interval: 5m
   condition:
     error: {}
+
+failover/spill:
+  priority_levels:
+    - [ logs/primary ]
+    - [ logs/spill ]
+  retry_interval: 30s
+  failover_after: 2m
+  retry_timeout: 5s
+  sending_queue:
+    enabled: false
+  condition:
+    error:
+      permanent: false
+
+failover/negativeduration:
+  priority_levels:
+    - [ traces/first ]
+    - [ traces/second ]
+  failover_after: -1s

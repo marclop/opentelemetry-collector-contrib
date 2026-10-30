@@ -46,9 +46,6 @@ func (f *metricsRouter) Consume(ctx context.Context, md pmetric.Metrics) error {
 func (f *metricsRouter) consumeByHealthyPipeline(ctx context.Context, md pmetric.Metrics) error {
 	for {
 		tc, idx := f.getCurrentConsumer()
-		if idx >= len(f.cfg.PipelinePriority) {
-			return errNoValidPipeline
-		}
 
 		// Preserve the original data for later attempts.
 		data := md
@@ -57,13 +54,13 @@ func (f *metricsRouter) consumeByHealthyPipeline(ctx context.Context, md pmetric
 			md.CopyTo(data)
 		}
 		if err := tc.ConsumeMetrics(ctx, data); err != nil {
-			if f.shouldFailoverOnError(err) {
-				f.reportConsumerError(idx, err)
+			if f.shouldFailoverOnError(err) && f.reportConsumerError(idx, err) {
 				continue
 			}
 			return err
 		}
 
+		f.pS.HandleSuccess()
 		return nil
 	}
 }
@@ -78,7 +75,9 @@ func (f *metricsRouter) sampleRetryConsumers(ctx context.Context, md pmetric.Met
 			data = pmetric.NewMetrics()
 			md.CopyTo(data)
 		}
-		err := consumer.ConsumeMetrics(ctx, data)
+		retryCtx, cancel := f.retryContext(ctx)
+		err := consumer.ConsumeMetrics(retryCtx, data)
+		cancel()
 		// if the returned error is not considered as failure
 		// reset the pipeline to healthy
 		if err == nil || !f.shouldFailoverOnError(err) {

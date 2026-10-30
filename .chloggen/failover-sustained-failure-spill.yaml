@@ -1,0 +1,16 @@
+change_type: enhancement
+
+component: connector/failover
+
+note: Add `failover_after`, `retry_timeout` and `condition.error.permanent`, and stop the last level from being marked unhealthy.
+
+issues: [46820, 51423]
+
+subtext: |
+  `failover_after` fails over only after a level has failed continuously for the given time.
+  `retry_timeout` bounds recovery attempts on higher levels. `condition.error.permanent: false` returns
+  permanent errors to the caller without failing over. When the last level fails its error is now
+  returned to the caller and the next call tries it again, instead of rejecting calls until the next
+  `retry_interval`.
+
+change_logs: [user]

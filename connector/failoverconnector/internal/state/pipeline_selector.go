@@ -6,6 +6,7 @@ package state // import "github.com/open-telemetry/opentelemetry-collector-contr
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,19 +17,43 @@ type PipelineSelector struct {
 	retryEnabledToken chan struct{}
 	retryChan         chan<- struct{}
 
+	// failingSince is the unix nano time of the first failure of the current level since its last
+	// success, or zero when the level is healthy.
+	failingSince atomic.Int64
+
 	retryCancel CancelManager
 	done        chan struct{}
 }
 
-// HandleError is called when an error is returned on a healthy pipeline
-func (p *PipelineSelector) HandleError(idx int) {
+// HandleError is called when an error is returned on a healthy pipeline. It reports whether the
+// caller should retry the data on the current level, which is true when the level moved on, either
+// now or earlier, and false while the failing level is still within FailoverAfter.
+func (p *PipelineSelector) HandleError(idx int) bool {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	if idx != p.currentPipeline {
-		return
+		return true
 	}
+	if p.constants.FailoverAfter > 0 {
+		now := time.Now().UnixNano()
+		since := p.failingSince.Load()
+		if since == 0 {
+			since = now
+			p.failingSince.Store(since)
+		}
+		if time.Duration(now-since) < p.constants.FailoverAfter {
+			return false
+		}
+	}
+	p.failingSince.Store(0)
 	p.NextStableLevel()
 	p.TryEnableRetry()
+	return true
+}
+
+// HandleSuccess is called when a pipeline accepted data, ending any streak of failures.
+func (p *PipelineSelector) HandleSuccess() {
+	p.failingSince.Store(0)
 }
 
 // NextStableLevel increments the level to the next in the priority list
@@ -88,6 +113,7 @@ func (p *PipelineSelector) CurrentPipeline() int {
 func (p *PipelineSelector) ResetHealthyPipeline(pipelineIndex int) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
+	p.failingSince.Store(0)
 	if pipelineIndex == 0 {
 		p.retryCancel.Cancel()
 		// Without this wait, a new failure can miss the token and leave retries stopped.

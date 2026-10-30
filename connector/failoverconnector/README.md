@@ -35,12 +35,15 @@ The following settings are available:
 
 - `priority_levels (required)`: list of pipeline level priorities in a 1 - n configuration, multiple pipelines can sit at a single priority level.
 - `retry_interval (optional)`: the frequency at which the pipeline levels will attempt to reestablish connection with all higher priority levels. Default value is 10 minutes. (See Example below for further explanation)
+- `failover_after (optional)`: how long a level must keep failing, with no success in between, before the connector moves to the next level. Until then the error is returned to the caller so the data can be retried upstream. Default value is `0`, which fails over on the first error.
+- `retry_timeout (optional)`: the maximum time a single recovery attempt on a higher level may take. The attempt uses live data, so without a bound a level that is still down holds up that call until its own retries give up. When the attempt times out the data goes to the current level. Default value is `0` (no bound).
 - `sending_queue (optional)`: queues and batches data in the connector before it is routed to a priority level. Supports the common [`sending_queue` settings][exporterhelper] and is enabled by default.
   We recommend configuring the queue here instead of on the exporters in the priority pipelines, and disabling `sending_queue` on those exporters.
   Moving the queue to the connector avoids data being stuck in the queue of an unhealthy exporter, where it cannot be failed over to another priority level.
 - `condition`: Conditional statements that decide when the connector should failover. Currently supports below types
     - `error`: 
-       - `contains`: ["network failure", "connection refused"] (required list of non-empty, case-insensitive substrings)
+       - `contains`: ["network failure", "connection refused"] (list of non-empty, case-insensitive substrings)
+       - `permanent`: whether errors classified by `consumererror.IsPermanent` trigger failover. When unset they are treated like any other error. When `false` they are returned to the caller as is and the level stays healthy. At least one of `contains` and `permanent` is required.
 
   Only errors whose message contains any configured string trigger failover. Non-matching errors are returned
   to the upstream caller without failing over, and they do not mark the pipeline level unhealthy during
@@ -48,6 +51,8 @@ The following settings are available:
 
 The connector intakes a list of `priority_levels` each of which can contain multiple pipelines.
 If any pipeline at a stable level fails, the level is considered unhealthy and the connector will move down one priority level and route all data to the new level (assuming it is stable).
+
+The last level never fails over. When it returns an error the error goes back to the caller and the next call tries the same level again.
 
 The connector will periodically try to reestablish a stable connection with the higher priority levels. `retry_interval` will be the frequency at which the connector will try to iterate through all unhealthy higher priority levels.
 
@@ -79,6 +84,26 @@ service:
     traces/also_first:
       receivers: [failover]
       exporters: [otlp_grpc/fourth]
+```
+
+#### Spilling to a queue while a destination is down
+
+To keep one failing destination from blocking the others, put a durable queue such as a Kafka topic at the last level. Disable the connector's `sending_queue` so errors reach the caller instead of being acknowledged early, give the exporters `sending_queue.wait_for_result: true`, and fail over only after the destination has been down for a while.
+
+```yaml
+connectors:
+  failover/destination:
+    sending_queue:
+      enabled: false
+    priority_levels:
+      - [logs/destination]
+      - [logs/spill]
+    failover_after: 2m
+    retry_timeout: 5s
+    retry_interval: 30s
+    condition:
+      error:
+        permanent: false
 ```
 
 [Connectors README]:https://github.com/open-telemetry/opentelemetry-collector/blob/main/connector/README.md

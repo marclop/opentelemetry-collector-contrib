@@ -46,6 +46,29 @@ func TestHandlePipelineError(t *testing.T) {
 	}, 3*time.Minute, 5*time.Millisecond)
 }
 
+func TestHandleErrorWaitsForFailoverAfter(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	pS := NewPipelineSelector(make(chan struct{}, 1), done, PSConstants{
+		RetryInterval: time.Hour,
+		FailoverAfter: 100 * time.Millisecond,
+	})
+
+	require.False(t, pS.HandleError(0), "first failure starts the clock")
+	require.Equal(t, 0, pS.CurrentPipeline())
+
+	pS.HandleSuccess()
+	require.False(t, pS.HandleError(0), "a success restarts the clock")
+
+	time.Sleep(120 * time.Millisecond)
+	require.True(t, pS.HandleError(0), "sustained failure moves to the next level")
+	require.Equal(t, 1, pS.CurrentPipeline())
+
+	require.True(t, pS.HandleError(0), "a failure reported against an older level means retry on the current one")
+	require.Equal(t, 1, pS.CurrentPipeline())
+	require.False(t, pS.HandleError(1), "the new level gets a fresh clock")
+}
+
 func TestCurrentPipelineWithReset(t *testing.T) {
 	done := make(chan struct{})
 	retryChan := make(chan struct{}, 1)

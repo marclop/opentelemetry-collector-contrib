@@ -15,6 +15,7 @@ import (
 var (
 	errNoPipelinePriority    = errors.New("No pipelines are defined in the priority list")
 	errInvalidRetryIntervals = errors.New("Retry interval must be positive")
+	errNegativeDuration      = errors.New("failover_after and retry_timeout must not be negative")
 )
 
 type Config struct {
@@ -31,6 +32,15 @@ type Config struct {
 	// all levels below the current
 	RetryInterval time.Duration `mapstructure:"retry_interval"`
 
+	// FailoverAfter is how long a level must keep failing, without a single success, before the connector
+	// moves to the next level. Until then errors are returned to the caller so upstream can retry. Zero
+	// fails over on the first error.
+	FailoverAfter time.Duration `mapstructure:"failover_after"`
+
+	// RetryTimeout bounds each recovery attempt on a higher level, so a level that is still down cannot
+	// hold up live data for longer. Zero means no bound beyond the caller's context.
+	RetryTimeout time.Duration `mapstructure:"retry_timeout"`
+
 	// Condition is an optional user-defined rule that controls which downstream
 	// errors trigger failover. When omitted, all errors trigger failover.
 	Condition configoptional.Optional[ConditionsConfig] `mapstructure:"condition"`
@@ -46,6 +56,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RetryInterval <= 0 {
 		return errInvalidRetryIntervals
+	}
+	if c.FailoverAfter < 0 || c.RetryTimeout < 0 {
+		return errNegativeDuration
 	}
 
 	return nil

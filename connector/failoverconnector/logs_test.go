@@ -161,7 +161,9 @@ func TestLogsWithFailoverError(t *testing.T) {
 
 	ld := sampleLog()
 
-	assert.EqualError(t, conn.ConsumeLogs(t.Context(), ld), "All provided pipelines return errors")
+	// The last level never fails over, so its own error goes back to the caller.
+	assert.ErrorIs(t, conn.ConsumeLogs(t.Context(), ld), errLogsConsumer)
+	assert.Equal(t, 2, failoverConnector.failover.TestGetCurrentConsumerIndex())
 }
 
 func TestLogsWithQueue(t *testing.T) {

@@ -5,29 +5,14 @@ package state // import "github.com/open-telemetry/opentelemetry-collector-contr
 
 import (
 	"context"
-	"sync"
 	"time"
 )
 
 type PSConstants struct {
 	RetryInterval time.Duration
+	FailoverAfter time.Duration
 	RetryGap      time.Duration
 	MaxRetries    int
-}
-
-type TryLock struct {
-	lock sync.Mutex
-}
-
-func (t *TryLock) TryExecute(fn func(int), arg int) {
-	if t.lock.TryLock() {
-		defer t.lock.Unlock()
-		fn(arg)
-	}
-}
-
-func NewTryLock() *TryLock {
-	return &TryLock{}
 }
 
 type CancelManager struct {

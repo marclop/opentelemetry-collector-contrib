@@ -46,9 +46,6 @@ func (f *logsRouter) Consume(ctx context.Context, ld plog.Logs) error {
 func (f *logsRouter) consumeByHealthyPipeline(ctx context.Context, ld plog.Logs) error {
 	for {
 		tc, idx := f.getCurrentConsumer()
-		if idx >= len(f.cfg.PipelinePriority) {
-			return errNoValidPipeline
-		}
 
 		// Preserve the original data for later attempts.
 		data := ld
@@ -57,13 +54,13 @@ func (f *logsRouter) consumeByHealthyPipeline(ctx context.Context, ld plog.Logs)
 			ld.CopyTo(data)
 		}
 		if err := tc.ConsumeLogs(ctx, data); err != nil {
-			if f.shouldFailoverOnError(err) {
-				f.reportConsumerError(idx, err)
+			if f.shouldFailoverOnError(err) && f.reportConsumerError(idx, err) {
 				continue
 			}
 			return err
 		}
 
+		f.pS.HandleSuccess()
 		return nil
 	}
 }
@@ -79,7 +76,9 @@ func (f *logsRouter) sampleRetryConsumers(ctx context.Context, ld plog.Logs) (bo
 			data = plog.NewLogs()
 			ld.CopyTo(data)
 		}
-		err := consumer.ConsumeLogs(ctx, data)
+		retryCtx, cancel := f.retryContext(ctx)
+		err := consumer.ConsumeLogs(retryCtx, data)
+		cancel()
 		// if the returned error is nil
 		// or not considered as failure - reset the pipeline to healthy
 		if err == nil || !f.shouldFailoverOnError(err) {
